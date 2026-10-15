@@ -6,6 +6,8 @@ Category · Age · AUM · Return · Expense ratio · Sortino · Alpha
 Run:  streamlit run app.py
 All data is pulled live (AMFI, mfapi.in, Kuvera) — no uploads needed.
 """
+import re
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -301,10 +303,24 @@ with tab_entry:
         # ---- exit load & lock-in
         with st.spinner("Looking up exit load and lock-in…"):
             xi = get_exit_info(str(er["code"]), str(er["isin"]), epick)
-        f1, f2, f3 = st.columns([2, 1, 1])
-        f1.metric("Exit load", xi["exit_load"] or "Not available")
-        f2.metric("Lock-in period", xi["lock_in"] or "Not available")
-        f3.metric("NAV as of", ez.index[-1].strftime("%d %b %Y"), f"₹{last.nav:,.2f}", delta_color="off")
+        _el = xi["exit_load"]
+        if not _el:
+            _el_pct, _el_time = "Not available", "Not available"
+        else:
+            _pcts = re.findall(r"(\d+(?:\.\d+)?)\s*%", _el)
+            _per = re.search(r"(\d+)\s*(day|month|year)s?", _el, re.I)
+            if not _pcts or re.fullmatch(r"\s*(nil|none|0+(\.0+)?\s*%?)\s*\.?\s*", _el, re.I):
+                _el_pct, _el_time = "Nil", "—"
+            else:
+                _el_pct = f"{float(_pcts[0]):g}%" + (" (tiered)" if len(set(_pcts)) > 1 else "")
+                _el_time = (f"{_per.group(1)} {_per.group(2).lower()}{'s' if _per.group(1) != '1' else ''}"
+                            if _per else "See note")
+        f1, f2, f3, f4 = st.columns(4)
+        f1.metric("Exit load %", _el_pct, help=_el or None)
+        f2.metric("Exit load applies for", _el_time, help="Redemptions within this period from each "
+                  "purchase / SIP instalment attract the exit load.")
+        f3.metric("Lock-in period", xi["lock_in"] or "Not available")
+        f4.metric("NAV as of", ez.index[-1].strftime("%d %b %Y"), f"₹{last.nav:,.2f}", delta_color="off")
         src = f"Source: {xi['source']}." if xi["source"] else ""
         if xi["url"]:
             src += f" [Scheme page]({xi['url']})"
