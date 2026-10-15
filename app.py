@@ -12,6 +12,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import caaresa_engine as eng
+import entry_timing as et  # add-on: entry-timing tab (not used in CAARESA scoring)
 
 st.set_page_config(page_title="CAARESA Fund Scanner", page_icon="📊", layout="wide")
 
@@ -135,8 +136,9 @@ c2.metric("Pass all CAARESA gates", len(passers))
 c3.metric(f"Benchmark 3Y / 5Y CAGR", f"{fmt(b3, '%', 1)} / {fmt(b5, '%', 1)}", help=bench_name)
 c4.metric("NAV data as of", asof.strftime("%d %b %Y"))
 
-tab_picks, tab_table, tab_exit, tab_method = st.tabs(
-    ["🏆 Top picks", "📋 Full scorecard", "🚪 Exit check (held funds)", "ℹ️ Method"])
+tab_picks, tab_table, tab_exit, tab_entry, tab_method = st.tabs(
+    ["🏆 Top picks", "📋 Full scorecard", "🚪 Exit check (held funds)",
+     "📈 Entry timing (NAV z-score)", "ℹ️ Method"])
 
 # ------------------------------------------------------------------ top picks
 with tab_picks:
@@ -271,4 +273,147 @@ debt funds are compared with the equal-weight average of their own category.
 Morningstar (which mostly use monthly data and TRI benchmarks). In a weak 3-year market, very few funds may
 clear Sortino > 1 — that is the screen working, not a bug. Debt funds rarely post Alpha > 1 against peers;
 relax the thresholds for debt. This is an educational screen, not investment advice.
+""")
+
+# ------------------------------------------------------------------ entry timing (add-on)
+# Informational only — nothing here feeds the CAARESA gates, score or ranking above.
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def get_exit_info(code: str, isin: str, name: str):
+    return et.fetch_exit_info(code, isin, name)
+
+
+with tab_entry:
+    st.info("**Add-on, not part of CAARESA scoring.** Use it to time *top-ups* into a fund you have "
+            "already chosen — keep the base SIP running regardless of these readings.")
+
+    names = res["name"].tolist()
+    epick = st.selectbox("Fund", names, index=0, key="entry_fund",
+                         help="Defaults to the #1 CAARESA pick. Any fund in this category can be checked.")
+    er = res[res["name"] == epick].iloc[0]
+    enav = navs.get(er["code"], pd.Series(dtype=float))
+
+    if len(enav) < et.MA_LEN + 5:
+        st.warning("Not enough NAV history for this fund (needs at least ~200 trading days).")
+    else:
+        ez = et.compute(enav)
+        last = ez.iloc[-1]
+
+        # ---- exit load & lock-in
+        with st.spinner("Looking up exit load and lock-in…"):
+            xi = get_exit_info(str(er["code"]), str(er["isin"]), epick)
+        f1, f2, f3 = st.columns([2, 1, 1])
+        f1.metric("Exit load", xi["exit_load"] or "Not available")
+        f2.metric("Lock-in period", xi["lock_in"] or "Not available")
+        f3.metric("NAV as of", ez.index[-1].strftime("%d %b %Y"), f"₹{last.nav:,.2f}", delta_color="off")
+        src = f"Source: {xi['source']}." if xi["source"] else ""
+        if xi["url"]:
+            src += f" [Scheme page]({xi['url']})"
+        st.caption(f"{src} Always confirm in the scheme's SID/KIM before investing — "
+                   "exit loads can change, and each SIP instalment has its own exit-load and lock-in clock.")
+
+        # ---- the two readings
+        lab_a, col_a = et.verdict(last.ma_dev_z)
+        lab_b, col_b = et.verdict(last.log_gap_z)
+        m1, m2 = st.columns(2)
+        with m1:
+            st.markdown("##### A · Deviation from 200-day average")
+            a1, a2 = st.columns(2)
+            a1.metric("NAV vs 200-DMA", fmt(last.ma_dev * 100, "%", 1))
+            a2.metric("Z-score (3-yr window)", fmt(last.ma_dev_z))
+            st.markdown(f"<span class='badge' style='background:{col_a}22;color:{col_a};"
+                        f"border:1px solid {col_a}66'>{lab_a}</span>", unsafe_allow_html=True)
+        with m2:
+            st.markdown("##### B · Gap from 5-year log trend")
+            b1, b2, b3_ = st.columns(3)
+            gap_pct = np.expm1(last.log_gap) * 100 if np.isfinite(last.log_gap) else np.nan
+            b1.metric("NAV vs trend", fmt(gap_pct, "%", 1))
+            b2.metric("Z-score", fmt(last.log_gap_z))
+            b3_.metric("Trend growth", fmt(last.trend_cagr, "% p.a.", 1))
+            st.markdown(f"<span class='badge' style='background:{col_b}22;color:{col_b};"
+                        f"border:1px solid {col_b}66'>{lab_b}</span>", unsafe_allow_html=True)
+
+        za, zb = last.ma_dev_z, last.log_gap_z
+        if np.isfinite(za) and np.isfinite(zb):
+            if za <= -1 and zb <= -1:
+                st.success("Both measures show a discount — a reasonable window for an extra top-up.")
+            elif za <= -1 or zb <= -1:
+                st.info("One measure shows a discount, the other does not — a partial / smaller top-up zone.")
+            elif za >= 2 or zb >= 2:
+                st.warning("NAV is well above its normal range — keep the SIP, hold back lump-sum top-ups.")
+            else:
+                st.caption("No timing signal — NAV is within its normal range. Continue the regular SIP.")
+        elif not np.isfinite(zb):
+            st.caption("Method B needs ~5 years of NAV history; only Method A is available for this fund.")
+
+        # ---- charts
+        yrs = st.radio("Chart period", ["3Y", "5Y", "10Y", "All"], index=1, horizontal=True, key="entry_period")
+        cut = ez.index[0] if yrs == "All" else ez.index[-1] - pd.DateOffset(years=int(yrs[:-1]))
+        v = ez.loc[cut:]
+
+        fig_n = go.Figure()
+        fig_n.add_scatter(x=v.index, y=v.nav, name="NAV", mode="lines", line=dict(width=1.6))
+        fig_n.add_scatter(x=v.index, y=v.sma, name=f"{et.MA_LEN}-day average", mode="lines",
+                          line=dict(width=1.2, color="#d9822b"))
+        fig_n.add_scatter(x=v.index, y=v.nav / np.exp(v.log_gap), name="5-yr log trend", mode="lines",
+                          line=dict(width=1.2, dash="dash", color="gray"))
+        fig_n.update_layout(height=340, margin=dict(l=10, r=10, t=30, b=10), yaxis_type="log",
+                            title=dict(text="NAV (log scale)", font=dict(size=14)),
+                            legend=dict(orientation="h", y=-0.15), hovermode="x unified")
+        st.plotly_chart(fig_n, width="stretch")
+
+        fig_z = go.Figure()
+        for y0, y1, c in [(-4, -2, "#1f9d55"), (-2, -1, "#5cb85c"), (1, 2, "#d9822b"), (2, 4, "#d64545")]:
+            fig_z.add_hrect(y0=y0, y1=y1, fillcolor=c, opacity=0.08, line_width=0)
+        fig_z.add_hline(y=0, line=dict(color="gray", width=1))
+        fig_z.add_scatter(x=v.index, y=v.ma_dev_z, name="A · 200-DMA deviation z", mode="lines",
+                          line=dict(width=1.4))
+        fig_z.add_scatter(x=v.index, y=v.log_gap_z, name="B · Log-trend gap z", mode="lines",
+                          line=dict(width=1.4))
+        fig_z.update_layout(height=340, margin=dict(l=10, r=10, t=30, b=10),
+                            title=dict(text="Z-scores (green = discount, red = stretched)", font=dict(size=14)),
+                            yaxis=dict(range=[-3.5, 3.5]), legend=dict(orientation="h", y=-0.15),
+                            hovermode="x unified")
+        st.plotly_chart(fig_z, width="stretch")
+
+    # ---- snapshot across funds (uses NAVs already loaded for the scan — no extra downloads)
+    st.markdown("#### Snapshot")
+    show_all = st.toggle("Show every fund in this category (default: top picks only)", key="entry_all")
+    rows = res if show_all else res.head(top_n)
+    snap = []
+    for r in rows.itertuples():
+        s = et.snapshot(navs.get(r.code))
+        if s:
+            snap.append({"Fund": r.name, "CAARESA pass": "✅" if r.PASS else "❌",
+                         "vs 200-DMA %": round(s["ma_dev"], 1), "A z": round(s["ma_dev_z"], 2),
+                         "A reading": et.verdict(s["ma_dev_z"])[0],
+                         "vs trend %": round(s["log_gap"], 1), "B z": round(s["log_gap_z"], 2),
+                         "B reading": et.verdict(s["log_gap_z"])[0]})
+    if snap:
+        st.dataframe(pd.DataFrame(snap), width="stretch", hide_index=True)
+
+    with st.expander("How these are calculated and how to read them"):
+        st.markdown(f"""
+**A · Deviation from the {et.MA_LEN}-day average**
+`dev = NAV ÷ SMA{et.MA_LEN} − 1`, then `z = (dev − mean) ÷ std` over the trailing {et.Z_LEN} trading days (~3 years).
+Reacts faster — good for tactical top-ups.
+
+**B · Gap from the log trend**
+Fit `ln(NAV) = a + b·t` over the trailing {et.TREND_LEN} trading days (~5 years).
+`gap = ln(NAV) − fitted value`; `z = gap ÷ std of the window's residuals`.
+`e^gap − 1` is the % above/below trend; `e^(252·b) − 1` is the trend growth rate.
+Slower and steadier — tells you where the NAV sits against its own long-run compounding path.
+
+Both use only data available on each day (no look-ahead).
+
+| Z-score | Reading | Suggested use |
+|---|---|---|
+| ≤ −2 | Deep discount (~1 day in 40) | Larger top-up |
+| −2 to −1 | Discount (~1 day in 6) | Normal top-up |
+| −1 to +1 | Around normal | SIP only |
+| +1 to +2 | Stretched | SIP only, no lump sum |
+| ≥ +2 | Very stretched | SIP only |
+
+**Limits.** NAV z-scores say a fund is cheap relative to *its own recent path*, not that the underlying
+stocks are cheap. Mean reversion in diversified funds is weak, so use this to size extra top-ups —
+not to stop or start the SIP. Mind exit load and capital-gains tax on any switch. Educational only.
 """)
